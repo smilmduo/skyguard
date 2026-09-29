@@ -197,7 +197,56 @@ class WeatherFeedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.feed.details["current"]["category"], "connection_failed")
         self.assertIsNone(self.feed.details["current"]["http_status"])
 
+    async def test_openweather_fetch_and_status(self):
+        self.feed.openweather_key = "test-ow-key"
+        def handler(request):
+            if "openweathermap.org" in str(request.url):
+                return httpx.Response(200, json={
+                    "main": {"temp": 28.5, "humidity": 65, "pressure": 1012},
+                    "dt": int(self.now)
+                })
+            return httpx.Response(200, json=self.payload())
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with patch("backend.weather_feed.time.time", return_value=self.now):
+                changed = await self.feed.refresh(self.buffers, client)
+                status = self.feed.status(self.buffers)
+        self.assertTrue(changed)
+        self.assertEqual(self.feed.current["a"]["temp"], 28.5)
+        self.assertEqual(self.feed.current["a"]["source"], "OPENWEATHER")
+        self.assertEqual(status["status"], "current")
+        self.assertEqual(status["source"], "OPENWEATHER")
+
+    async def test_openweather_failure_falls_back_to_open_meteo(self):
+        self.feed.openweather_key = "test-ow-key"
+        def handler(request):
+            if "openweathermap.org" in str(request.url):
+                return httpx.Response(500, json={"message": "server error"})
+            return httpx.Response(200, json=self.payload())
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with patch("backend.weather_feed.time.time", return_value=self.now):
+                changed = await self.feed.refresh(self.buffers, client)
+        self.assertTrue(changed)
+        self.assertEqual(self.feed.current["a"]["temp"], 25)
+        self.assertEqual(self.feed.current["a"]["source"], "OPEN_METEO")
+
+    def test_openweather_appid_redaction(self):
+        self.feed.openweather_key = "secret-ow-token"
+        response = httpx.Response(401, json={"reason": "Invalid appid=secret-ow-token"})
+        diagnostic = self.feed.diagnostic(response, ValueError())
+        self.assertNotIn("secret-ow-token", diagnostic["reason"])
+
+    async def test_history_fallback_when_all_points_older_than_cutoff(self):
+        import backend.app as module
+        from datetime import timedelta
+        now = datetime.now(timezone.utc)
+        records = deque([{"timestamp": (now - timedelta(hours=48 + h)).isoformat()} for h in range(5)])
+        with patch.object(module, "processed_telemetry", records):
+            result = await module.get_telemetry_history(24)
+        self.assertEqual(len(result), 5)
 
 
 if __name__ == "__main__":
     unittest.main()
+

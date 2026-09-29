@@ -580,7 +580,7 @@ def rebuild_processed_telemetry():
 
         processed_telemetry.append({
             "timestamp": ts_iso,
-            "source": "SIMULATED_FAULT" if any(fault_registry.values()) else "OPEN_METEO",
+            "source": "SIMULATED_FAULT" if any(fault_registry.values()) else luck_entry.get("source", "OPEN_METEO"),
             "raw_temp": cur_t,
             "raw_pres": cur_p,
             "raw_rh": cur_r,
@@ -615,8 +615,12 @@ async def get_telemetry_live():
 async def get_telemetry_history(hours: int = 24):
     if not processed_telemetry:
         return []
-    cutoff = datetime.now(IST) - timedelta(hours=max(1, min(hours, 120)))
-    return [row for row in processed_telemetry if datetime.fromisoformat(row["timestamp"]) >= cutoff]
+    req_hours = max(1, min(hours, 120))
+    cutoff = datetime.now(IST) - timedelta(hours=req_hours)
+    filtered = [row for row in processed_telemetry if datetime.fromisoformat(row["timestamp"]) >= cutoff]
+    if filtered:
+        return filtered
+    return list(processed_telemetry)[-req_hours:]
 
 @app.get("/api/model/info")
 async def get_model_info():
@@ -641,8 +645,11 @@ async def get_telemetry_multi_station(hours: int = 24):
     if not luck_buf:
         return []
     
-    cutoff = datetime.now(IST) - timedelta(hours=max(1, min(hours, 120)))
+    req_hours = max(1, min(hours, 120))
+    cutoff = datetime.now(IST) - timedelta(hours=req_hours)
     target_entries = [row for row in luck_buf if row["timestamp"] >= cutoff]
+    if not target_entries:
+        target_entries = luck_buf[-req_hours:]
     
     neighbors = ["kanpur", "barabanki", "sitapur"]
     neighbor_maps = {

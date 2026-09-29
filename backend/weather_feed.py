@@ -22,6 +22,7 @@ class WeatherFeed:
         self.stations = stations
         self.interval = max(60, int(os.getenv("POLLING_INTERVAL_SEC", "900")))
         self.key = os.getenv("OPEN_METEO_API_KEY", "").strip()
+        self.openweather_key = os.getenv("OPENWEATHER_API_KEY", "").strip() or os.getenv("OPENWEATHERMAP_API_KEY", "").strip()
         self.url = ("https://customer-api.open-meteo.com/v1/forecast" if self.key
                     else "https://api.open-meteo.com/v1/forecast")
         self.cache_path = Path(cache_path or os.getenv(
@@ -44,8 +45,9 @@ class WeatherFeed:
             restored = {}
             for station in self.stations:
                 restored[station] = [self.reading(
-                    row["timestamp"], row["raw_temp"], row["raw_rh"], row["raw_pres"]
-                ) for row in payload["stations"][station] if row.get("source") == "OPEN_METEO"
+                    row["timestamp"], row["raw_temp"], row["raw_rh"], row["raw_pres"],
+                    source=row.get("source", "OPEN_METEO")
+                ) for row in payload["stations"][station] if row.get("source") in ("OPEN_METEO", "OPENWEATHER")
                     and datetime.fromisoformat(row["timestamp"]).timestamp() % 3600 == 0]
             for station, rows in restored.items():
                 buffers[station].extend(sorted(rows, key=lambda row: row["timestamp"]))
@@ -54,7 +56,8 @@ class WeatherFeed:
             self.failure_counts = payload.get("failure_counts", self.failure_counts)
             self.last_success = payload.get("last_success")
             self.error = payload.get("error")
-            self.current = {s: self.reading(row["timestamp"], row["raw_temp"], row["raw_rh"], row["raw_pres"])
+            self.current = {s: self.reading(row["timestamp"], row["raw_temp"], row["raw_rh"], row["raw_pres"],
+                                            source=row.get("source", "OPEN_METEO"))
                             for s, row in payload.get("current", {}).items() if s in self.stations}
             self.history_next = float(payload.get("history_next", 0))
             self.blocked_until = float(payload.get("blocked_until", 0))
@@ -70,7 +73,7 @@ class WeatherFeed:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "stations": {s: [dict(row, timestamp=row["timestamp"].isoformat())
-                                  for row in rows if row.get("source") == "OPEN_METEO"]
+                                  for row in rows if row.get("source") in ("OPEN_METEO", "OPENWEATHER")]
                              for s, rows in buffers.items()},
                 "current": {s: dict(row, timestamp=row["timestamp"].isoformat()) for s, row in self.current.items()},
                 "failure_counts": self.failure_counts,
@@ -86,8 +89,15 @@ class WeatherFeed:
             logger.warning("Could not persist weather cache; data remains in memory.")
 
     @staticmethod
-    def reading(timestamp, temp, rh, pres):
-        dt = datetime.fromisoformat(timestamp)
+    def reading(timestamp, temp, rh, pres, source="OPEN_METEO"):
+        if isinstance(timestamp, (int, float)):
+            dt = datetime.fromtimestamp(timestamp, timezone.utc)
+        elif isinstance(timestamp, str):
+            dt = datetime.fromisoformat(timestamp)
+        elif isinstance(timestamp, datetime):
+            dt = timestamp
+        else:
+            raise ValueError(f"Invalid timestamp type: {type(timestamp)}")
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         values = [float(temp), float(rh), float(pres)]
@@ -95,7 +105,7 @@ class WeatherFeed:
             raise ValueError("Non-finite weather value")
         return {"timestamp": dt, "temp": values[0], "rh": values[1], "pres": values[2],
                 "raw_temp": values[0], "raw_rh": values[1], "raw_pres": values[2],
-                "source": "OPEN_METEO"}
+                "source": source}
 
     def retry_delay(self, response, now):
         delay = min(3600, 300 * 2 ** min(self.failures - 1, 4))
@@ -129,22 +139,45 @@ class WeatherFeed:
                 pass
         if self.key:
             reason = reason.replace(self.key, "[redacted]")
+        if self.openweather_key:
+            reason = reason.replace(self.openweather_key, "[redacted]")
         reason = re.sub(r"(?i)(apikey=)[^&\s]+", r"\1[redacted]", reason)
+        reason = re.sub(r"(?i)(appid=)[^&\s]+", r"\1[redacted]", reason)
         reason = " ".join(reason.split())[:300]
         return {"category": category, "http_status": status, "reason": reason,
                 "retry_after": response.headers.get("Retry-After") if response is not None else None}
 
+    async def refresh_openweather_current(self, client, now):
+        """Fetch current weather for all stations from OpenWeatherMap API."""
+        ow_readings = {}
+        for station, coords in self.stations.items():
+            params = {
+                "lat": coords["lat"],
+                "lon": coords["lon"],
+                "appid": self.openweather_key,
+                "units": "metric",
+            }
+            resp = await client.get("https://api.openweathermap.org/data/2.5/weather", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            main = data.get("main", {})
+            dt_val = data.get("dt", int(now))
+            ow_readings[station] = self.reading(
+                dt_val, main["temp"], main["humidity"], main["pressure"], source="OPENWEATHER"
+            )
+        return ow_readings
+
     async def refresh(self, buffers, client=None):
         async with self.lock:
             now = time.time()
-            if now < self.blocked_until:
+            if now < self.blocked_until and not self.openweather_key:
                 return False
             changed = False
             async with AsyncExitStack() as stack:
                 if client is None:
                     client = await stack.enter_async_context(httpx.AsyncClient(timeout=20))
                 for kind in ("current", "history"):
-                    if now < self.blocked_until:
+                    if now < self.blocked_until and (kind != "current" or not self.openweather_key):
                         break
                     due = self.next_attempt if kind == "current" else self.history_next
                     if now < due:
@@ -152,6 +185,47 @@ class WeatherFeed:
                     if kind == "history" and not self.history_missing(buffers, now):
                         self.history_next = (int(now // 3600) + 1) * 3600 + 60
                         continue
+
+                    # If OpenWeather API key is configured, use OpenWeather for live current conditions
+                    if kind == "current" and self.openweather_key:
+                        ow_success = False
+                        response = None
+                        try:
+                            ow_readings = await self.refresh_openweather_current(client, now)
+                            accepted = 0
+                            for station, row in ow_readings.items():
+                                if row["timestamp"].timestamp() > now + 300:
+                                    row["timestamp"] = datetime.fromtimestamp(now, timezone.utc)
+                                previous = self.current.get(station)
+                                if previous is None or row["timestamp"] >= previous["timestamp"]:
+                                    self.current[station] = row
+                                accepted += 1
+                                # Keep hourly buffers updated when an hour boundary passes
+                                hour_stamp = row["timestamp"].replace(minute=0, second=0, microsecond=0)
+                                if int(hour_stamp.timestamp()) <= int(now):
+                                    merged = {r["timestamp"]: r for r in buffers[station]}
+                                    if hour_stamp not in merged:
+                                        hourly_row = self.reading(hour_stamp, row["temp"], row["rh"], row["pres"], source="OPENWEATHER")
+                                        merged[hour_stamp] = hourly_row
+                                        buffers[station].clear()
+                                        buffers[station].extend(merged[t] for t in sorted(merged))
+                            if accepted == len(self.stations):
+                                self.station_errors["current"] = {}
+                                self.details["current"] = None
+                                self.failure_counts["current"] = 0
+                                self.error = None
+                                self.last_success = datetime.fromtimestamp(now, timezone.utc).isoformat()
+                                self.failures = 0
+                                self.next_attempt = now + self.interval
+                                changed = True
+                                ow_success = True
+                        except Exception as exc:
+                            logger.warning("OpenWeather current fetch failed (%s); falling back to Open-Meteo", exc)
+                            self.details["current"] = self.diagnostic(response, exc)
+                        
+                        if ow_success:
+                            continue
+
                     params = {
                         "latitude": ",".join(str(c["lat"]) for c in self.stations.values()),
                         "longitude": ",".join(str(c["lon"]) for c in self.stations.values()),
@@ -253,7 +327,8 @@ class WeatherFeed:
         states = [s["status"] for s in stations.values()]
         state = "current" if all(s == "current" for s in states) else (
             "unavailable" if all(s == "unavailable" for s in states) else "stale")
-        return {"status": state, "source": "OPEN_METEO", "provider_error": self.error,
+        source = "OPENWEATHER" if (self.openweather_key and any(r.get("source") == "OPENWEATHER" for r in self.current.values())) else "OPEN_METEO"
+        return {"status": state, "source": source, "provider_error": self.error,
                 "last_success": self.last_success, "stations": stations, "diagnostics": self.details,
                 "station_errors": self.station_errors,
                 "history_complete": not self.history_missing(buffers, now),
