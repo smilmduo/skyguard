@@ -601,7 +601,7 @@ def rebuild_processed_telemetry():
         })
 
 # API Routes
-@app.get("/api/weather/status")
+@app.api_route("/api/weather/status", methods=["GET", "HEAD"])
 async def get_weather_status():
     return weather_feed.status(telemetry_buffers)
 
@@ -622,7 +622,7 @@ async def get_telemetry_history(hours: int = 24):
         return filtered
     return list(processed_telemetry)[-req_hours:]
 
-@app.get("/api/model/info")
+@app.api_route("/api/model/info", methods=["GET", "HEAD"])
 async def get_model_info():
     return {
         "revision": os.getenv("RENDER_GIT_COMMIT", "local"),
@@ -715,7 +715,7 @@ async def clear_telemetry_anomalies():
         "message": "Anomaly audit history cleared"
     }
 
-@app.get("/api/sensor/health")
+@app.api_route("/api/sensor/health", methods=["GET", "HEAD"])
 async def get_sensor_health():
     if not processed_telemetry:
         return {

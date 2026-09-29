@@ -105,6 +105,8 @@ class WeatherFeedTests(unittest.IsolatedAsyncioTestCase):
         from backend.app import app
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             self.assertEqual((await client.head("/")).status_code, 200)
+            self.assertEqual((await client.head("/api/model/info")).status_code, 200)
+            self.assertEqual((await client.head("/api/weather/status")).status_code, 200)
             self.assertEqual((await client.get("/api/weather/status")).json()["status"], "unavailable")
             self.assertEqual((await client.post("/api/telemetry/ingest", json=[])).status_code, 410)
 
