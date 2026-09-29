@@ -138,6 +138,38 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Failed to prime {station}: {e}")
 
+    # Fallback Diurnal Seeder: Ensure buffers are populated even if Open-Meteo returns 429
+    if any(len(telemetry_buffers[s]) < 24 for s in STATIONS):
+        logger.warning("One or more telemetry buffers have < 24 observations (Open-Meteo rate limit). Seeding 48h synchronized diurnal baseline...")
+        for s in STATIONS:
+            telemetry_buffers[s].clear()
+        base_now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        station_offsets = {
+            "lucknow": {"temp_base": 28.5, "rh_base": 62.0, "pres_base": 1008.0},
+            "kanpur": {"temp_base": 29.0, "rh_base": 60.0, "pres_base": 1007.5},
+            "barabanki": {"temp_base": 28.0, "rh_base": 64.0, "pres_base": 1008.5},
+            "sitapur": {"temp_base": 27.5, "rh_base": 65.0, "pres_base": 1009.0},
+        }
+        for h in range(48, -1, -1):
+            dt = base_now - timedelta(hours=h)
+            hour_of_day = dt.hour
+            solar_phase = math.sin((hour_of_day - 8.0) / 24.0 * 2 * math.pi)
+            baro_tide = math.cos(hour_of_day / 12.0 * 2 * math.pi)
+            for station, offsets in station_offsets.items():
+                t_val = round(offsets["temp_base"] + 5.5 * solar_phase, 2)
+                rh_val = round(max(20.0, min(98.0, offsets["rh_base"] - 18.0 * solar_phase)), 1)
+                p_val = round(offsets["pres_base"] - 1.5 * baro_tide, 2)
+                telemetry_buffers[station].append({
+                    "timestamp": dt,
+                    "temp": t_val,
+                    "rh": rh_val,
+                    "pres": p_val,
+                    "raw_temp": t_val,
+                    "raw_rh": rh_val,
+                    "raw_pres": p_val
+                })
+        logger.info("Successfully primed all station buffers with 48h diurnal synchronized baseline.")
+
     # Initial processing of primed buffer
     apply_active_faults()
     rebuild_processed_telemetry()

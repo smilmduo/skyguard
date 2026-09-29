@@ -84,9 +84,11 @@ def main():
             "plan": "free",
             "region": args.region,
             "rootDir": "huggingface",
-            "buildCommand": "pip install -r requirements.txt",
-            "startCommand": "uvicorn app:app --host 0.0.0.0 --port $PORT",
             "healthCheckPath": "/api/model/info",
+            "envSpecificDetails": {
+                "buildCommand": "pip install -r requirements.txt",
+                "startCommand": "uvicorn app:app --host 0.0.0.0 --port $PORT"
+            },
             "envVars": [
                 { "key": "PYTHON_VERSION", "value": "3.11.9" }
             ]

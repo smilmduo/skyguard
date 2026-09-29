@@ -5,7 +5,7 @@
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": "https://skyguard-backend.onrender.com/api/$1"
+      "destination": "https://skyguard-backend-es6k.onrender.com/api/$1"
     },
     {
       "source": "/(.*)",
