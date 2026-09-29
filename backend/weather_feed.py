@@ -220,7 +220,11 @@ class WeatherFeed:
                                 changed = True
                                 ow_success = True
                         except Exception as exc:
-                            logger.warning("OpenWeather current fetch failed (%s); falling back to Open-Meteo", exc)
+                            err_msg = str(exc)
+                            if self.openweather_key:
+                                err_msg = err_msg.replace(self.openweather_key, "[redacted]")
+                            err_msg = re.sub(r"(?i)(appid=)[^&\s]+", r"\1[redacted]", err_msg)
+                            logger.warning("OpenWeather current fetch failed (%s); falling back to Open-Meteo", err_msg)
                             self.details["current"] = self.diagnostic(response, exc)
                         
                         if ow_success:
