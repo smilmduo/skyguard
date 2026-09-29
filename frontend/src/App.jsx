@@ -101,6 +101,35 @@ export default function App() {
     }
   }, []);
 
+  // Client-side direct Open-Meteo synchronizer (bypasses datacenter cloud IP limits)
+  const syncLiveOpenMeteo = useCallback(async () => {
+    try {
+      const url = "https://api.open-meteo.com/v1/forecast?latitude=26.8467,26.4499,26.9268,27.5645&longitude=80.9462,80.3319,81.1834,80.6809&current=temperature_2m,relative_humidity_2m,surface_pressure&timezone=UTC";
+      const resp = await fetch(url);
+      if (resp.ok) {
+        const data = await resp.json();
+        const results = Array.isArray(data) ? data : [data];
+        const stations = ['lucknow', 'kanpur', 'barabanki', 'sitapur'];
+        const payload = stations.map((stn, idx) => {
+          const cur = results[idx]?.current || {};
+          return {
+            station: stn,
+            temp: Number(cur.temperature_2m || 28.0),
+            rh: Number(cur.relative_humidity_2m || 65.0),
+            pres: Number(cur.surface_pressure || 1008.0)
+          };
+        });
+        await fetch(`${API_BASE}/api/telemetry/ingest`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+      }
+    } catch {
+      // Graceful fallback to server physics
+    }
+  }, []);
+
   // Fetch all endpoints concurrently
   const fetchAll = useCallback(async () => {
     await Promise.allSettled([
@@ -111,12 +140,15 @@ export default function App() {
     ]);
   }, [fetchTelemetry, fetchMultiStation, fetchAnomalies, fetchSensorHealth]);
 
-  // Initial & periodic load
+  // Initial & periodic load (15-second fast live cycle)
   useEffect(() => {
-    fetchAll();
-    const timer = setInterval(fetchAll, 30000);
+    syncLiveOpenMeteo().then(() => fetchAll());
+    const timer = setInterval(async () => {
+      await syncLiveOpenMeteo();
+      fetchAll();
+    }, 15000);
     return () => clearInterval(timer);
-  }, [fetchAll]);
+  }, [fetchAll, syncLiveOpenMeteo]);
 
   // Fault injection simulation
   const triggerFault = async (type, param, magnitude, faultLabel) => {

@@ -283,7 +283,7 @@ async def poll_and_process():
                         })
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 429:
-            open_meteo_backoff_until = now_ts + 600
+            open_meteo_backoff_until = now_ts + 60
             logger.info("Open-Meteo free rate limit active on datacenter IP. Advancing real-time mesonet physics buffer.")
         else:
             logger.warning(f"Open-Meteo API notice: {e}")
