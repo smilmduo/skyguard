@@ -83,7 +83,7 @@ def main():
             "env": "python",
             "plan": "free",
             "region": args.region,
-            "rootDir": "deployment/huggingface",
+            "rootDir": "huggingface",
             "buildCommand": "pip install -r requirements.txt",
             "startCommand": "uvicorn app:app --host 0.0.0.0 --port $PORT",
             "healthCheckPath": "/api/model/info",
