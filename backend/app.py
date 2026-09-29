@@ -27,6 +27,8 @@ logger = logging.getLogger("skyguard-hf")
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
 MODELS_DIR = PROJECT_ROOT / "models"
+if not MODELS_DIR.exists():
+    MODELS_DIR = PROJECT_ROOT.parent / "models"
 STATIC_DIR = PROJECT_ROOT / "dist"
 if not STATIC_DIR.exists():
     STATIC_DIR = PROJECT_ROOT / "frontend" / "dist"
