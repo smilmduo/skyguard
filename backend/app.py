@@ -15,10 +15,6 @@ from pydantic import BaseModel
 import numpy as np
 import joblib
 
-try:
-    from imd_service import imd_service, IMD_STATION_MAP
-except ImportError:
-    from backend.imd_service import imd_service, IMD_STATION_MAP
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -967,92 +963,6 @@ async def api_fault_reset(clear_history: bool = False):
         "latest_state": processed_telemetry[-1] if processed_telemetry else None
     }
 
-# ==============================================================================
-# OFFICIAL IMD INTEGRATION ENDPOINTS
-# ==============================================================================
-
-class IMDConfigureRequest(BaseModel):
-    api_key: str
-    jwt_token: str
-
-@app.get("/api/imd/status")
-async def get_imd_status():
-    status = await imd_service.check_connection()
-    return {
-        "status": status,
-        "stations": IMD_STATION_MAP,
-        "endpoints": {
-            "current_weather": "https://api.imd.gov.in/api/v1/current_wx",
-            "city_forecast": "https://api.imd.gov.in/api/v1/cityforecastloc",
-            "station_nowcast": "https://api.imd.gov.in/api/v1/stationnowcast",
-            "district_nowcast": "https://api.imd.gov.in/api/v1/districtnowcast",
-            "aws_data": "https://api.imd.gov.in/api/v1/aws_data",
-            "district_warning": "https://api.imd.gov.in/api/v1/districtwarning"
-        },
-        "docs_url": "https://api.imd.gov.in/public/api_reference.html#api-3"
-    }
-
-@app.post("/api/imd/configure")
-async def configure_imd(req: IMDConfigureRequest):
-    imd_service.set_credentials(req.api_key, req.jwt_token)
-    status = await imd_service.check_connection()
-    return {
-        "status": "success",
-        "configured": bool(req.api_key and req.jwt_token),
-        "connection_check": status
-    }
-
-@app.get("/api/imd/current")
-async def get_imd_current(station: str = "lucknow"):
-    return await imd_service.get_current_weather(station)
-
-@app.get("/api/imd/forecast")
-async def get_imd_forecast(station: str = "lucknow"):
-    return await imd_service.get_city_forecast(station)
-
-@app.get("/api/imd/nowcast")
-async def get_imd_nowcast(station: str = "lucknow"):
-    return await imd_service.get_nowcast(station)
-
-@app.get("/api/imd/aws")
-async def get_imd_aws(state_id: str = "5"):
-    return await imd_service.get_aws_data(state_id)
-
-@app.post("/api/imd/poll-cluster")
-async def poll_imd_cluster():
-    results = {}
-    now = datetime.now(timezone.utc)
-    for stn_key in STATIONS:
-        wx = await imd_service.get_current_weather(stn_key)
-        d = wx.get("data", {})
-        try:
-            temp = float(d.get("Temperature deg C", 28.0))
-            rh = float(d.get("Humidity %", 65.0))
-            pres = float(d.get("M.S.L.P", 1008.0))
-        except (ValueError, TypeError):
-            temp, rh, pres = 28.0, 65.0, 1008.0
-            
-        telemetry_buffers[stn_key].append({
-            "timestamp": now,
-            "temp": temp, "rh": rh, "pres": pres,
-            "raw_temp": temp, "raw_rh": rh, "raw_pres": pres,
-            "source": wx.get("source", "IMD_API_3")
-        })
-        results[stn_key] = {
-            "temp": temp,
-            "rh": rh,
-            "pres": pres,
-            "weather": d.get("Weather Description"),
-            "source": wx.get("source")
-        }
-        
-    apply_active_faults()
-    rebuild_processed_telemetry()
-    return {
-        "status": "success",
-        "ingested_stations": results,
-        "latest_state": processed_telemetry[-1] if processed_telemetry else None
-    }
 
 # ==============================================================================
 # HUGGING FACE SPACES STATIC FRONTEND SERVING
