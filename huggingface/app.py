@@ -95,48 +95,54 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to load ML artifacts: {e}", exc_info=True)
 
-    # Prime buffers with historical Open-Meteo data (3 days past)
-    logger.info("Priming telemetry buffers with historical Open-Meteo observations...")
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for station, coords in STATIONS.items():
-            try:
-                url = "https://api.open-meteo.com/v1/forecast"
-                params = {
-                    "latitude": coords["lat"],
-                    "longitude": coords["lon"],
-                    "hourly": "temperature_2m,relative_humidity_2m,surface_pressure",
-                    "past_days": 3,
-                    "forecast_days": 0,
-                    "timezone": "UTC"
-                }
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-                hourly = data.get("hourly", {})
-                
-                times = hourly.get("time", [])
-                temps = hourly.get("temperature_2m", [])
-                rhs = hourly.get("relative_humidity_2m", [])
-                pres = hourly.get("surface_pressure", [])
-                
-                for t_idx, ts in enumerate(times):
-                    dt = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
-                    t_val = temps[t_idx]
-                    r_val = rhs[t_idx]
-                    p_val = pres[t_idx]
-                    if t_val is not None and r_val is not None and p_val is not None:
-                        telemetry_buffers[station].append({
-                            "timestamp": dt,
-                            "temp": float(t_val),
-                            "rh": float(r_val),
-                            "pres": float(p_val),
-                            "raw_temp": float(t_val),
-                            "raw_rh": float(r_val),
-                            "raw_pres": float(p_val)
-                        })
-                logger.info(f"Primed {station} with {len(telemetry_buffers[station])} observations.")
-            except Exception as e:
-                logger.error(f"Failed to prime {station}: {e}")
+    # Prime buffers with historical Open-Meteo data (3 days past) in a single batch request
+    logger.info("Priming telemetry buffers with historical Open-Meteo observations (batch query)...")
+    station_names = list(STATIONS.keys())
+    lats = ",".join(str(STATIONS[s]["lat"]) for s in station_names)
+    lons = ",".join(str(STATIONS[s]["lon"]) for s in station_names)
+    headers = {"User-Agent": "SkyGuard-AWS-Monitor/2.0 (IMD Anomaly Detection Research; smilmduo)"}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
+            url = "https://api.open-meteo.com/v1/forecast"
+            params = {
+                "latitude": lats,
+                "longitude": lons,
+                "hourly": "temperature_2m,relative_humidity_2m,surface_pressure",
+                "past_days": 3,
+                "forecast_days": 0,
+                "timezone": "UTC"
+            }
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            results = data if isinstance(data, list) else [data]
+            for idx, station in enumerate(station_names):
+                if idx < len(results):
+                    stn_data = results[idx]
+                    hourly = stn_data.get("hourly", {})
+                    times = hourly.get("time", [])
+                    temps = hourly.get("temperature_2m", [])
+                    rhs = hourly.get("relative_humidity_2m", [])
+                    pres = hourly.get("surface_pressure", [])
+                    for t_idx, ts in enumerate(times):
+                        dt = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
+                        t_val = temps[t_idx]
+                        r_val = rhs[t_idx]
+                        p_val = pres[t_idx]
+                        if t_val is not None and r_val is not None and p_val is not None:
+                            telemetry_buffers[station].append({
+                                "timestamp": dt,
+                                "temp": float(t_val),
+                                "rh": float(r_val),
+                                "pres": float(p_val),
+                                "raw_temp": float(t_val),
+                                "raw_rh": float(r_val),
+                                "raw_pres": float(p_val)
+                            })
+                    logger.info(f"Primed {station} with {len(telemetry_buffers[station])} observations.")
+    except Exception as e:
+        logger.warning(f"Batch historical priming notice: {e}")
 
     # Fallback Diurnal Seeder: Ensure buffers are populated even if Open-Meteo returns 429
     if any(len(telemetry_buffers[s]) < 24 for s in STATIONS):
@@ -203,49 +209,58 @@ async def poll_open_meteo_loop():
         await asyncio.sleep(60)
 
 async def poll_and_process():
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        for station, coords in STATIONS.items():
-            try:
-                url = "https://api.open-meteo.com/v1/forecast"
-                params = {
-                    "latitude": coords["lat"],
-                    "longitude": coords["lon"],
-                    "current": "temperature_2m,relative_humidity_2m,surface_pressure",
-                    "timezone": "UTC"
-                }
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                current = resp.json().get("current", {})
-                
-                raw_t = current.get("time")
-                if raw_t:
-                    dt = datetime.fromisoformat(raw_t).replace(tzinfo=timezone.utc)
-                else:
-                    dt = datetime.now(timezone.utc)
-                    
-                temp = float(current.get("temperature_2m", 25.0))
-                rh = float(current.get("relative_humidity_2m", 60.0))
-                pres = float(current.get("surface_pressure", 1005.0))
-                
-                if telemetry_buffers[station] and telemetry_buffers[station][-1]["timestamp"] == dt:
-                    telemetry_buffers[station][-1]["raw_temp"] = temp
-                    telemetry_buffers[station][-1]["raw_rh"] = rh
-                    telemetry_buffers[station][-1]["raw_pres"] = pres
-                else:
-                    telemetry_buffers[station].append({
-                        "timestamp": dt,
-                        "temp": temp, "rh": rh, "pres": pres,
-                        "raw_temp": temp, "raw_rh": rh, "raw_pres": pres
-                    })
-            except httpx.HTTPStatusError as e:
-                logger.warning(f"Open-Meteo API Error for {station}: {e}. Repeating last cached reading.")
-                if telemetry_buffers[station]:
-                    last_entry = dict(telemetry_buffers[station][-1])
-                    last_entry["timestamp"] = datetime.now(timezone.utc)
-                    last_entry["network_timeout"] = True
-                    telemetry_buffers[station].append(last_entry)
-            except Exception as e:
-                logger.error(f"Unexpected error fetching {station}: {e}")
+    station_names = list(STATIONS.keys())
+    lats = ",".join(str(STATIONS[s]["lat"]) for s in station_names)
+    lons = ",".join(str(STATIONS[s]["lon"]) for s in station_names)
+    headers = {"User-Agent": "SkyGuard-AWS-Monitor/2.0 (IMD Anomaly Detection Research; smilmduo)"}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+            url = "https://api.open-meteo.com/v1/forecast"
+            params = {
+                "latitude": lats,
+                "longitude": lons,
+                "current": "temperature_2m,relative_humidity_2m,surface_pressure",
+                "timezone": "UTC"
+            }
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            results = data if isinstance(data, list) else [data]
+
+            for idx, station in enumerate(station_names):
+                if idx < len(results):
+                    current = results[idx].get("current", {})
+                    raw_t = current.get("time")
+                    if raw_t:
+                        dt = datetime.fromisoformat(raw_t).replace(tzinfo=timezone.utc)
+                    else:
+                        dt = datetime.now(timezone.utc)
+
+                    temp = float(current.get("temperature_2m", 25.0))
+                    rh = float(current.get("relative_humidity_2m", 60.0))
+                    pres = float(current.get("surface_pressure", 1005.0))
+
+                    if telemetry_buffers[station] and telemetry_buffers[station][-1]["timestamp"] == dt:
+                        telemetry_buffers[station][-1]["raw_temp"] = temp
+                        telemetry_buffers[station][-1]["raw_rh"] = rh
+                        telemetry_buffers[station][-1]["raw_pres"] = pres
+                    else:
+                        telemetry_buffers[station].append({
+                            "timestamp": dt,
+                            "temp": temp, "rh": rh, "pres": pres,
+                            "raw_temp": temp, "raw_rh": rh, "raw_pres": pres
+                        })
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"Open-Meteo API notice: {e}. Repeating last cached readings across stations.")
+        for station in STATIONS:
+            if telemetry_buffers[station]:
+                last_entry = dict(telemetry_buffers[station][-1])
+                last_entry["timestamp"] = datetime.now(timezone.utc)
+                last_entry["network_timeout"] = True
+                telemetry_buffers[station].append(last_entry)
+    except Exception as e:
+        logger.error(f"Unexpected error fetching telemetry: {e}")
 
     apply_active_faults()
     rebuild_processed_telemetry()
