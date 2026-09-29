@@ -219,6 +219,12 @@ class WeatherFeed:
                                 self.next_attempt = now + self.interval
                                 changed = True
                                 ow_success = True
+                                luck_r = ow_readings.get("lucknow", {})
+                                logger.info(
+                                    "OpenWeather live feed synced (%d/%d stations) | Lucknow: %.1f°C, %.0f%% RH, %.1f hPa",
+                                    accepted, len(self.stations),
+                                    luck_r.get("temp", 0), luck_r.get("rh", 0), luck_r.get("pres", 0)
+                                )
                         except Exception as exc:
                             err_msg = str(exc)
                             if self.openweather_key:
