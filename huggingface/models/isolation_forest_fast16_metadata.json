@@ -1,0 +1,46 @@
+{
+  "model_name": "SkyGuard Fast Anomaly ML Specialist (16 Features)",
+  "model_path": "models/isolation_forest_fast16.joblib",
+  "sha256": "314f5d62661b30cee50ee3fa704bc20727855bfdb20d0de27e30ae0616d9192f",
+  "n_features_in": 16,
+  "feature_order": [
+    "temp_delta",
+    "pres_delta",
+    "rh_delta",
+    "temp_accel",
+    "pres_accel",
+    "temp_ew_z",
+    "pres_ew_z",
+    "rh_ew_z",
+    "temp_flatline_count",
+    "pres_flatline_count",
+    "rh_flatline_count",
+    "t_rh_discordance",
+    "rh_overshoot",
+    "spatial_temp_res",
+    "spatial_pres_res",
+    "spatial_rh_res"
+  ],
+  "hyperparameters": {
+    "n_estimators": 200,
+    "max_samples": 1024,
+    "max_features": 0.9,
+    "random_state": 42
+  },
+  "phase2_evaluation": {
+    "far_hybrid": 0.003934,
+    "far_ml_only": 0.005091,
+    "far_note": "FAST_ML_ONLY_FAR_BORDERLINE",
+    "spike_event_recall": 0.8372,
+    "stagnation_event_recall": 1.0,
+    "thermodynamic_event_recall": 1.0,
+    "cross_sensor_event_recall": 1.0,
+    "overall_fast_event_recall": 0.9263
+  },
+  "calibrated_thresholds": {
+    "t_moderate": 0.4942,
+    "t_extreme": 0.5647,
+    "k": 4,
+    "use_physical_bypass": true
+  }
+}

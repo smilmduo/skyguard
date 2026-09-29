@@ -1,0 +1,39 @@
+{
+  "features": [
+    "temp_delta",
+    "pres_delta",
+    "rh_delta",
+    "temp_accel",
+    "pres_accel",
+    "temp_ew_z",
+    "pres_ew_z",
+    "rh_ew_z",
+    "temp_flatline_count",
+    "pres_flatline_count",
+    "rh_flatline_count",
+    "t_rh_discordance",
+    "rh_overshoot",
+    "spatial_temp_res",
+    "spatial_pres_res",
+    "spatial_rh_res"
+  ],
+  "mean_baseline": [
+    -0.02200007300000027,
+    0.05487759999999639,
+    0.3089844300000001,
+    0.09099996699999956,
+    -0.039463200000006964,
+    -0.20267098705796097,
+    0.09141496476858309,
+    0.14300903341895527,
+    0.02,
+    0.01,
+    0.0,
+    -1.0696756464026784,
+    0.0,
+    0.13772518700000036,
+    1.6676665000000015,
+    -0.30400134999999956
+  ],
+  "sample_count": 100
+}

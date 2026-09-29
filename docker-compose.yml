@@ -1,0 +1,38 @@
+services:
+  skyguard-backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: skyguard-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - CORS_ORIGINS=http://localhost,http://localhost:80
+      - LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/model/info')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - skyguard-net
+
+  skyguard-frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: skyguard-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      skyguard-backend:
+        condition: service_healthy
+    networks:
+      - skyguard-net
+
+networks:
+  skyguard-net:
+    driver: bridge

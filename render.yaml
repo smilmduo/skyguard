@@ -1,0 +1,14 @@
+services:
+  # SkyGuard AI — Real-Time Meteorological Anomaly Detection & Self-Healing Telemetry Engine
+  - type: web
+    name: skyguard-backend
+    env: python
+    region: oregon
+    plan: free
+    rootDir: deployment/huggingface
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/model/info
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
