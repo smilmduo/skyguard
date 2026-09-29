@@ -16,6 +16,47 @@ function cn(...inputs) {
 
 const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 
+const formatISTTime = (isoStr) => {
+  if (!isoStr) return '';
+  try {
+    const d = new Date(isoStr);
+    if (isNaN(d.getTime())) {
+      const match = String(isoStr).match(/T(\d{2}:\d{2})/);
+      return match ? match[1] : String(isoStr);
+    }
+    return d.toLocaleTimeString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    });
+  } catch {
+    return String(isoStr);
+  }
+};
+
+const formatISTTooltip = (isoStr) => {
+  if (!isoStr) return '';
+  try {
+    const d = new Date(isoStr);
+    if (isNaN(d.getTime())) return String(isoStr);
+    const timeStr = d.toLocaleTimeString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    });
+    const dateStr = d.toLocaleDateString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      day: 'numeric',
+      month: 'short'
+    });
+    return `${timeStr} IST (${dateStr})`;
+  } catch {
+    return String(isoStr);
+  }
+};
+
 export default function App() {
   const [clock, setClock] = useState('');
   const [activeTab, setActiveTab] = useState('telemetry'); // 'telemetry' | 'multi_station' | 'anomaly_history' | 'sensor_health'
@@ -25,6 +66,7 @@ export default function App() {
   const [multiStationData, setMultiStationData] = useState([]);
   const [anomalies, setAnomalies] = useState([]);
   const [sensorHealth, setSensorHealth] = useState(null);
+  const [weatherStatus, setWeatherStatus] = useState(null);
 
   // Simulation & Selection states
   const [activeFault, setActiveFault] = useState(null);
@@ -37,14 +79,19 @@ export default function App() {
   const [anomalyFilterFlag, setAnomalyFilterFlag] = useState('ALL');
 
 
-  // Clock timer
+
+  // Clock timer (Indian Standard Time)
   useEffect(() => {
     const timer = setInterval(() => {
       const now = new Date();
-      const hours = String(now.getHours()).padStart(2, '0');
-      const minutes = String(now.getMinutes()).padStart(2, '0');
-      const seconds = String(now.getSeconds()).padStart(2, '0');
-      setClock(`${hours}:${minutes}:${seconds}`);
+      const istTime = now.toLocaleTimeString('en-IN', {
+        timeZone: 'Asia/Kolkata',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+      });
+      setClock(`${istTime} IST`);
     }, 1000);
     return () => clearInterval(timer);
   }, []);
@@ -101,32 +148,17 @@ export default function App() {
     }
   }, []);
 
-  // Client-side direct Open-Meteo synchronizer (bypasses datacenter cloud IP limits)
-  const syncLiveOpenMeteo = useCallback(async () => {
+  const fetchWeatherStatus = useCallback(async () => {
     try {
-      const url = "https://api.open-meteo.com/v1/forecast?latitude=26.8467,26.4499,26.9268,27.5645&longitude=80.9462,80.3319,81.1834,80.6809&current=temperature_2m,relative_humidity_2m,surface_pressure&timezone=UTC";
-      const resp = await fetch(url);
-      if (resp.ok) {
-        const data = await resp.json();
-        const results = Array.isArray(data) ? data : [data];
-        const stations = ['lucknow', 'kanpur', 'barabanki', 'sitapur'];
-        const payload = stations.map((stn, idx) => {
-          const cur = results[idx]?.current || {};
-          return {
-            station: stn,
-            temp: Number(cur.temperature_2m || 28.0),
-            rh: Number(cur.relative_humidity_2m || 65.0),
-            pres: Number(cur.surface_pressure || 1008.0)
-          };
-        });
-        await fetch(`${API_BASE}/api/telemetry/ingest`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
+      const response = await fetch(`${API_BASE}/api/weather/status`);
+      if (response.status === 404) {
+        setWeatherStatus({ status: 'unavailable', provider_error: 'backend_update_required' });
+        return;
       }
+      if (!response.ok) throw new Error('Weather status unavailable');
+      setWeatherStatus(await response.json());
     } catch {
-      // Graceful fallback to server physics
+      setWeatherStatus({ status: 'unavailable', provider_error: 'backend_unreachable' });
     }
   }, []);
 
@@ -136,19 +168,17 @@ export default function App() {
       fetchTelemetry(),
       fetchMultiStation(),
       fetchAnomalies(),
-      fetchSensorHealth()
+      fetchSensorHealth(),
+      fetchWeatherStatus()
     ]);
-  }, [fetchTelemetry, fetchMultiStation, fetchAnomalies, fetchSensorHealth]);
+  }, [fetchTelemetry, fetchMultiStation, fetchAnomalies, fetchSensorHealth, fetchWeatherStatus]);
 
-  // Initial & periodic load (15-second fast live cycle)
+  // Browsers read the shared server cache; only the backend polls the provider.
   useEffect(() => {
-    syncLiveOpenMeteo().then(() => fetchAll());
-    const timer = setInterval(async () => {
-      await syncLiveOpenMeteo();
-      fetchAll();
-    }, 15000);
+    fetchAll();
+    const timer = setInterval(fetchAll, 15000);
     return () => clearInterval(timer);
-  }, [fetchAll, syncLiveOpenMeteo]);
+  }, [fetchAll]);
 
   // Fault injection simulation
   const triggerFault = async (type, param, magnitude, faultLabel) => {
@@ -198,7 +228,7 @@ export default function App() {
   const exportToCSV = () => {
     if (!anomalies.length) return;
     const headers = [
-      'Timestamp (UTC)',
+      'Timestamp (IST)',
       'Root Cause',
       'QC Flag',
       'Anomaly Score',
@@ -268,13 +298,39 @@ export default function App() {
   // If user selected a historical anomaly in Tab 3, inspect that; otherwise inspect latest live record.
   const activeInspection = selectedHistoricalAnomaly || latest;
 
-  if (telemetry.length === 0) {
-    return (
-      <div className="flex flex-col items-center justify-center h-screen text-slate-400 bg-slate-950 font-data-mono-lg gap-3">
-        <div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin"></div>
-        <span>Initializing SkyGuard Fast Specialist & SHAP Pipeline...</span>
+  const weatherMessage = weatherStatus?.provider_error === 'backend_update_required'
+    ? 'The backend needs updating: the weather status endpoint is missing.'
+    : weatherStatus?.provider_error === 'backend_unreachable'
+      ? 'Cannot reach the backend. Check the connection and deployment.'
+      : weatherStatus?.diagnostics?.current?.reason || (weatherStatus?.status === 'current'
+        ? 'Current conditions from Open-Meteo weather models.'
+        : 'Waiting for current weather. Cached readings retain their original timestamps.');
+  const currentWeatherPanel = (
+    <section aria-label="Current Open-Meteo weather" className="bg-slate-900 text-slate-200 px-4 py-3 shrink-0">
+      <div className="text-sm" role="status">{weatherMessage}</div>
+      <div className="flex flex-wrap gap-6 mt-2">
+        {Object.entries(weatherStatus?.stations || {}).map(([station, data]) => (
+          <div key={station} className="text-sm">
+            <strong className="capitalize">{station}</strong> - {data.status}
+            {data.reading && <div>{data.reading.temp} °C / {data.reading.rh}% RH / {data.reading.pres} hPa
+              <div className="text-xs text-slate-400">Valid: {formatISTTooltip(data.reading.timestamp)}</div>
+            </div>}
+          </div>
+        ))}
       </div>
-    );
+      {weatherStatus?.next_retry && <div className="text-xs mt-2">Next current-weather attempt: {formatISTTooltip(weatherStatus.next_retry)}</div>}
+      {weatherStatus?.diagnostics?.history && <div className="text-xs text-amber-300">Hourly history: {weatherStatus.diagnostics.history.reason}</div>}
+      {weatherStatus && !weatherStatus.history_complete && <div className="text-xs text-amber-300">Hourly history is incomplete; recovery continues independently of current weather.</div>}
+      <a href="https://open-meteo.com/" className="text-xs underline">Weather data by Open-Meteo</a>
+    </section>
+  );
+
+  if (telemetry.length === 0) {
+    return <main className="min-h-screen bg-slate-950 text-slate-300 p-6">
+      <h1 className="text-xl mb-4">SkyGuard — Current Weather</h1>
+      {currentWeatherPanel}
+      <p className="mt-4">Anomaly analysis is waiting for sufficient synchronized hourly history. Current conditions appear above as soon as available.</p>
+    </main>;
   }
 
   // Max SHAP attribution for scaling bar chart
@@ -282,11 +338,17 @@ export default function App() {
     ? Math.max(...activeInspection.top_drivers.map(d => Math.abs(d.attribution || 0)), 0.1)
     : 1.0;
 
-  // Multi-station latest record for residuals and badges
-  const msLatest = multiStationData.length > 0 ? multiStationData[multiStationData.length - 1] : null;
+  const currentStation = (station) => weatherStatus?.stations?.[station];
 
   return (
     <div className="bg-slate-950 text-on-surface antialiased font-body-sm h-screen flex flex-col relative overflow-hidden">
+      {weatherStatus?.status !== 'current' && (
+        <div role="status" className="bg-amber-950 text-amber-200 px-4 py-2 text-sm shrink-0">
+          {weatherStatus?.status === 'stale' ? 'Weather data is stale. Showing the last available readings.' : 'Weather feed unavailable or connecting. Displayed readings may be outdated.'}
+          {weatherStatus?.provider_error === 'rate_limited' && ' The provider has rate-limited requests; retrying automatically.'}
+          {weatherStatus?.last_observations?.lucknow && ` Last reading: ${formatISTTooltip(weatherStatus.last_observations.lucknow)}.`}
+        </div>
+      )}
       {/* Top Header */}
       <header className="bg-surface border-b border-outline-variant flex justify-between items-center w-full px-panel-padding h-12 z-50 shrink-0">
         <div className="flex items-center gap-4">
@@ -512,10 +574,20 @@ export default function App() {
                   </span>
                 </div>
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={telemetry} margin={{ top: 24, right: 10, left: -20, bottom: 0 }}>
-                    <XAxis dataKey="timestamp" tick={false} axisLine={false} />
+                  <LineChart data={telemetry} margin={{ top: 22, right: 15, left: -10, bottom: 2 }}>
+                    <XAxis
+                      dataKey="timestamp"
+                      tickFormatter={formatISTTime}
+                      tick={{ fontSize: 9, fill: '#64748b' }}
+                      axisLine={{ stroke: '#334155' }}
+                      tickLine={false}
+                      minTickGap={35}
+                    />
                     <YAxis domain={['auto', 'auto']} tick={{ fontSize: 10, fill: '#88929b' }} axisLine={false} tickLine={false} />
-                    <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', fontSize: '11px' }} labelStyle={{ display: 'none' }} />
+                    <Tooltip
+                      contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '6px', fontSize: '11px' }}
+                      labelFormatter={formatISTTooltip}
+                    />
                     <Line type="monotone" dataKey="raw_temp" name="Raw Temp" stroke="#f43f5e" strokeDasharray="3 3" dot={false} isAnimationActive={false} />
                     <Line type="monotone" dataKey="healed_temp" name="Healed Temp" stroke="#10b981" strokeWidth={2.5} dot={false} isAnimationActive={false} />
                   </LineChart>
@@ -531,10 +603,20 @@ export default function App() {
                   </span>
                 </div>
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={telemetry} margin={{ top: 24, right: 10, left: -20, bottom: 0 }}>
-                    <XAxis dataKey="timestamp" tick={false} axisLine={false} />
+                  <LineChart data={telemetry} margin={{ top: 22, right: 15, left: -10, bottom: 2 }}>
+                    <XAxis
+                      dataKey="timestamp"
+                      tickFormatter={formatISTTime}
+                      tick={{ fontSize: 9, fill: '#64748b' }}
+                      axisLine={{ stroke: '#334155' }}
+                      tickLine={false}
+                      minTickGap={35}
+                    />
                     <YAxis domain={['auto', 'auto']} tick={{ fontSize: 10, fill: '#88929b' }} axisLine={false} tickLine={false} />
-                    <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', fontSize: '11px' }} labelStyle={{ display: 'none' }} />
+                    <Tooltip
+                      contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '6px', fontSize: '11px' }}
+                      labelFormatter={formatISTTooltip}
+                    />
                     <Line type="monotone" dataKey="raw_pres" name="Raw Pres" stroke="#f43f5e" strokeDasharray="3 3" dot={false} isAnimationActive={false} />
                     <Line type="monotone" dataKey="healed_pres" name="Healed Pres" stroke="#38bdf8" strokeWidth={2.5} dot={false} isAnimationActive={false} />
                   </LineChart>
@@ -550,10 +632,20 @@ export default function App() {
                   </span>
                 </div>
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={telemetry} margin={{ top: 24, right: 10, left: -20, bottom: 0 }}>
-                    <XAxis dataKey="timestamp" tick={false} axisLine={false} />
+                  <LineChart data={telemetry} margin={{ top: 22, right: 15, left: -10, bottom: 2 }}>
+                    <XAxis
+                      dataKey="timestamp"
+                      tickFormatter={formatISTTime}
+                      tick={{ fontSize: 9, fill: '#64748b' }}
+                      axisLine={{ stroke: '#334155' }}
+                      tickLine={false}
+                      minTickGap={35}
+                    />
                     <YAxis domain={['auto', 'auto']} tick={{ fontSize: 10, fill: '#88929b' }} axisLine={false} tickLine={false} />
-                    <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', fontSize: '11px' }} labelStyle={{ display: 'none' }} />
+                    <Tooltip
+                      contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '6px', fontSize: '11px' }}
+                      labelFormatter={formatISTTooltip}
+                    />
                     <Line type="monotone" dataKey="raw_rh" name="Raw RH" stroke="#f43f5e" strokeDasharray="3 3" dot={false} isAnimationActive={false} />
                     <Line type="monotone" dataKey="healed_rh" name="Healed RH" stroke="#a855f7" strokeWidth={2.5} dot={false} isAnimationActive={false} />
                   </LineChart>
@@ -565,63 +657,28 @@ export default function App() {
           {/* VIEW 2: Mesonetwork Consensus (4 Stations, Exactly 3 Consolidated Charts) */}
           {activeTab === 'multi_station' && (
             <div className="flex-1 overflow-y-auto flex flex-col p-4 gap-4">
-              {/* Station Spatial Residuals Summary Bar */}
-              <div className="grid grid-cols-4 gap-3">
-                <div className="bg-slate-900/60 border border-slate-800 rounded-lg p-2.5 flex flex-col">
-                  <div className="flex justify-between items-center">
-                    <span className="text-[10px] font-label-caps text-emerald-400 font-bold">TARGET: LUCKNOW</span>
-                    <span className={cn("w-2 h-2 rounded-full", latest?.is_anomaly ? "bg-emerald-400 animate-pulse" : "bg-emerald-400")}></span>
-                  </div>
-                  <div className="text-xs font-data-mono-lg font-bold text-emerald-400 mt-1">
-                    {msLatest?.temp_lucknow}°C | {msLatest?.pres_lucknow} hPa
-                  </div>
-                  <div className="text-[10px] text-slate-400 font-data-mono-lg mt-0.5">
-                    ΔT vs Med: <strong className={Math.abs(msLatest?.spatial_delta_temp || 0) > 3 ? "text-wmo-amber font-bold" : "text-slate-300"}>{msLatest?.spatial_delta_temp > 0 ? `+${msLatest?.spatial_delta_temp}` : msLatest?.spatial_delta_temp}°C</strong>
-                  </div>
-                </div>
-
-                <div className="bg-slate-900/60 border border-slate-800 rounded-lg p-2.5 flex flex-col">
-                  <div className="flex justify-between items-center">
-                    <span className="text-[10px] font-label-caps text-sky-400 font-bold">NEIGHBOR: KANPUR</span>
-                    <span className="w-1.5 h-1.5 rounded-full bg-sky-400"></span>
-                  </div>
-                  <div className="text-xs font-data-mono-lg font-bold text-sky-400 mt-1">
-                    {msLatest?.temp_kanpur}°C | {msLatest?.pres_kanpur} hPa
-                  </div>
-                  <div className="text-[10px] text-slate-400 font-data-mono-lg mt-0.5">
-                    RH: {msLatest?.rh_kanpur}% | Weight: 0.35
-                  </div>
-                </div>
-
-                <div className="bg-slate-900/60 border border-slate-800 rounded-lg p-2.5 flex flex-col">
-                  <div className="flex justify-between items-center">
-                    <span className="text-[10px] font-label-caps text-amber-400 font-bold">NEIGHBOR: BARABANKI</span>
-                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
-                  </div>
-                  <div className="text-xs font-data-mono-lg font-bold text-amber-400 mt-1">
-                    {msLatest?.temp_barabanki}°C | {msLatest?.pres_barabanki} hPa
-                  </div>
-                  <div className="text-[10px] text-slate-400 font-data-mono-lg mt-0.5">
-                    RH: {msLatest?.rh_barabanki}% | Weight: 0.38
-                  </div>
-                </div>
-
-                <div className="bg-slate-900/60 border border-slate-800 rounded-lg p-2.5 flex flex-col">
-                  <div className="flex justify-between items-center">
-                    <span className="text-[10px] font-label-caps text-purple-400 font-bold">NEIGHBOR: SITAPUR</span>
-                    <span className="w-1.5 h-1.5 rounded-full bg-purple-400"></span>
-                  </div>
-                  <div className="text-xs font-data-mono-lg font-bold text-purple-400 mt-1">
-                    {msLatest?.temp_sitapur}°C | {msLatest?.pres_sitapur} hPa
-                  </div>
-                  <div className="text-[10px] text-slate-400 font-data-mono-lg mt-0.5">
-                    RH: {msLatest?.rh_sitapur}% | Weight: 0.27
-                  </div>
-                </div>
+              <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 shrink-0">
+                {[
+                  ['lucknow', 'Lucknow', 'text-emerald-400', '26.8467, 80.9462'],
+                  ['kanpur', 'Kanpur', 'text-sky-400', '26.4499, 80.3319'],
+                  ['barabanki', 'Barabanki', 'text-amber-400', '26.9268, 81.1834'],
+                  ['sitapur', 'Sitapur', 'text-purple-400', '27.5645, 80.6809'],
+                ].map(([id, label, color, coordinates]) => {
+                  const station = currentStation(id);
+                  const reading = station?.reading;
+                  return <div key={id} className="bg-slate-900/60 border border-slate-800 rounded-lg p-2.5">
+                    <div className={cn('text-xs font-bold', color)}>{label} <span className="text-slate-400 font-normal">· {station?.status || 'unavailable'}</span></div>
+                    <div className={cn('text-sm font-data-mono-lg font-bold mt-1', color)}>
+                      {reading ? `${reading.temp}°C | ${reading.pres} hPa` : 'No current reading'}
+                    </div>
+                    <div className="text-[10px] text-slate-400 mt-1">{reading ? `RH: ${reading.rh}% · Valid ${formatISTTooltip(reading.timestamp)}` : 'Waiting for provider'}</div>
+                    <div className="text-[10px] text-slate-500 mt-1" title="Configured forecast coordinates">{coordinates}</div>
+                  </div>;
+                })}
               </div>
 
               {/* Chart 1 of 3: Consolidated Temperature Chart (All 4 Stations) */}
-              <div className="h-56 border border-slate-800 bg-slate-900/50 rounded-lg p-3 relative shadow-sm">
+              <div className="h-64 min-h-64 shrink-0 border border-slate-800 bg-slate-900/50 rounded-lg p-3 relative shadow-sm">
                 <div className="flex justify-between items-center mb-1">
                   <div className="font-data-mono-lg text-xs font-bold text-amber-400 flex items-center gap-2">
                     <span>1. CONSOLIDATED AMBIENT TEMPERATURE (°C)</span>
@@ -635,20 +692,31 @@ export default function App() {
                   </div>
                 </div>
                 <ResponsiveContainer width="100%" height="86%">
-                  <LineChart data={multiStationData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                    <XAxis dataKey="timestamp" tick={false} axisLine={false} />
+                  <LineChart data={multiStationData} margin={{ top: 10, right: 15, left: -10, bottom: 2 }}>
+                    <XAxis
+                      dataKey="timestamp"
+                      tickFormatter={formatISTTime}
+                      tick={{ fontSize: 9, fill: '#64748b' }}
+                      axisLine={{ stroke: '#334155' }}
+                      tickLine={false}
+                      minTickGap={35}
+                    />
                     <YAxis domain={['auto', 'auto']} tick={{ fontSize: 10, fill: '#88929b' }} axisLine={false} tickLine={false} />
-                    <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', fontSize: '11px' }} />
-                    <Line type="monotone" dataKey="temp_lucknow" name="Lucknow (Target)" stroke="#10b981" strokeWidth={2.5} dot={false} isAnimationActive={false} />
-                    <Line type="monotone" dataKey="temp_kanpur" name="Kanpur" stroke="#38bdf8" strokeWidth={1.8} dot={false} isAnimationActive={false} />
-                    <Line type="monotone" dataKey="temp_barabanki" name="Barabanki" stroke="#fbbf24" strokeWidth={1.8} dot={false} isAnimationActive={false} />
-                    <Line type="monotone" dataKey="temp_sitapur" name="Sitapur" stroke="#c084fc" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+                    <Tooltip
+                      contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '6px', fontSize: '11px' }}
+                      labelFormatter={formatISTTooltip}
+                      formatter={(value, name) => [Number(value).toFixed(1), name]}
+                    />
+                    <Line type="linear" dataKey="temp_lucknow" name="Lucknow (Target)" stroke="#10b981" strokeWidth={2.5} dot={false} isAnimationActive={false} />
+                    <Line type="linear" dataKey="temp_kanpur" name="Kanpur" stroke="#38bdf8" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+                    <Line type="linear" dataKey="temp_barabanki" name="Barabanki" stroke="#fbbf24" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+                    <Line type="linear" dataKey="temp_sitapur" name="Sitapur" stroke="#c084fc" strokeWidth={1.8} dot={false} isAnimationActive={false} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
 
               {/* Chart 2 of 3: Consolidated Pressure Chart (All 4 Stations) */}
-              <div className="h-56 border border-slate-800 bg-slate-900/50 rounded-lg p-3 relative shadow-sm">
+              <div className="h-64 min-h-64 shrink-0 border border-slate-800 bg-slate-900/50 rounded-lg p-3 relative shadow-sm">
                 <div className="flex justify-between items-center mb-1">
                   <div className="font-data-mono-lg text-xs font-bold text-sky-400 flex items-center gap-2">
                     <span>2. CONSOLIDATED SURFACE PRESSURE (hPa)</span>
@@ -662,20 +730,31 @@ export default function App() {
                   </div>
                 </div>
                 <ResponsiveContainer width="100%" height="86%">
-                  <LineChart data={multiStationData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                    <XAxis dataKey="timestamp" tick={false} axisLine={false} />
+                  <LineChart data={multiStationData} margin={{ top: 10, right: 15, left: -10, bottom: 2 }}>
+                    <XAxis
+                      dataKey="timestamp"
+                      tickFormatter={formatISTTime}
+                      tick={{ fontSize: 9, fill: '#64748b' }}
+                      axisLine={{ stroke: '#334155' }}
+                      tickLine={false}
+                      minTickGap={35}
+                    />
                     <YAxis domain={['auto', 'auto']} tick={{ fontSize: 10, fill: '#88929b' }} axisLine={false} tickLine={false} />
-                    <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', fontSize: '11px' }} />
-                    <Line type="monotone" dataKey="pres_lucknow" name="Lucknow (Target)" stroke="#10b981" strokeWidth={2.5} dot={false} isAnimationActive={false} />
-                    <Line type="monotone" dataKey="pres_kanpur" name="Kanpur" stroke="#38bdf8" strokeWidth={1.8} dot={false} isAnimationActive={false} />
-                    <Line type="monotone" dataKey="pres_barabanki" name="Barabanki" stroke="#fbbf24" strokeWidth={1.8} dot={false} isAnimationActive={false} />
-                    <Line type="monotone" dataKey="pres_sitapur" name="Sitapur" stroke="#c084fc" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+                    <Tooltip
+                      contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '6px', fontSize: '11px' }}
+                      labelFormatter={formatISTTooltip}
+                      formatter={(value, name) => [Number(value).toFixed(1), name]}
+                    />
+                    <Line type="linear" dataKey="pres_lucknow" name="Lucknow (Target)" stroke="#10b981" strokeWidth={2.5} dot={false} isAnimationActive={false} />
+                    <Line type="linear" dataKey="pres_kanpur" name="Kanpur" stroke="#38bdf8" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+                    <Line type="linear" dataKey="pres_barabanki" name="Barabanki" stroke="#fbbf24" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+                    <Line type="linear" dataKey="pres_sitapur" name="Sitapur" stroke="#c084fc" strokeWidth={1.8} dot={false} isAnimationActive={false} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
 
               {/* Chart 3 of 3: Consolidated Relative Humidity Chart (All 4 Stations) */}
-              <div className="h-56 border border-slate-800 bg-slate-900/50 rounded-lg p-3 relative shadow-sm">
+              <div className="h-64 min-h-64 shrink-0 border border-slate-800 bg-slate-900/50 rounded-lg p-3 relative shadow-sm">
                 <div className="flex justify-between items-center mb-1">
                   <div className="font-data-mono-lg text-xs font-bold text-emerald-400 flex items-center gap-2">
                     <span>3. CONSOLIDATED RELATIVE HUMIDITY (%)</span>
@@ -689,14 +768,25 @@ export default function App() {
                   </div>
                 </div>
                 <ResponsiveContainer width="100%" height="86%">
-                  <LineChart data={multiStationData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                    <XAxis dataKey="timestamp" tick={false} axisLine={false} />
+                  <LineChart data={multiStationData} margin={{ top: 10, right: 15, left: -10, bottom: 2 }}>
+                    <XAxis
+                      dataKey="timestamp"
+                      tickFormatter={formatISTTime}
+                      tick={{ fontSize: 9, fill: '#64748b' }}
+                      axisLine={{ stroke: '#334155' }}
+                      tickLine={false}
+                      minTickGap={35}
+                    />
                     <YAxis domain={['auto', 'auto']} tick={{ fontSize: 10, fill: '#88929b' }} axisLine={false} tickLine={false} />
-                    <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', fontSize: '11px' }} />
-                    <Line type="monotone" dataKey="rh_lucknow" name="Lucknow (Target)" stroke="#10b981" strokeWidth={2.5} dot={false} isAnimationActive={false} />
-                    <Line type="monotone" dataKey="rh_kanpur" name="Kanpur" stroke="#38bdf8" strokeWidth={1.8} dot={false} isAnimationActive={false} />
-                    <Line type="monotone" dataKey="rh_barabanki" name="Barabanki" stroke="#fbbf24" strokeWidth={1.8} dot={false} isAnimationActive={false} />
-                    <Line type="monotone" dataKey="rh_sitapur" name="Sitapur" stroke="#c084fc" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+                    <Tooltip
+                      contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '6px', fontSize: '11px' }}
+                      labelFormatter={formatISTTooltip}
+                      formatter={(value, name) => [Number(value).toFixed(1), name]}
+                    />
+                    <Line type="linear" dataKey="rh_lucknow" name="Lucknow (Target)" stroke="#10b981" strokeWidth={2.5} dot={false} isAnimationActive={false} />
+                    <Line type="linear" dataKey="rh_kanpur" name="Kanpur" stroke="#38bdf8" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+                    <Line type="linear" dataKey="rh_barabanki" name="Barabanki" stroke="#fbbf24" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+                    <Line type="linear" dataKey="rh_sitapur" name="Sitapur" stroke="#c084fc" strokeWidth={1.8} dot={false} isAnimationActive={false} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
@@ -808,7 +898,7 @@ export default function App() {
                   <table className="w-full text-left border-collapse text-xs font-data-mono-lg">
                     <thead className="bg-slate-950/80 text-[10px] font-label-caps text-slate-400 uppercase tracking-wider sticky top-0 border-b border-slate-800 z-10">
                       <tr>
-                        <th className="py-2.5 px-3">Timestamp (UTC)</th>
+                        <th className="py-2.5 px-3">Timestamp (IST)</th>
                         <th className="py-2.5 px-3">Diagnostic Triage</th>
                         <th className="py-2.5 px-3 text-center">QC Flag</th>
                         <th className="py-2.5 px-3 text-right">Raw vs Healed</th>
@@ -834,7 +924,7 @@ export default function App() {
                               )}
                             >
                               <td className="py-2 px-3 text-slate-300 whitespace-nowrap text-[11px]">
-                                {item.timestamp ? item.timestamp.replace('T', ' ').slice(0, 19) : '—'}
+                                {item.timestamp ? formatISTTooltip(item.timestamp) : '—'}
                               </td>
                               <td className="py-2 px-3 max-w-[220px] truncate">
                                 <span className={cn(
@@ -1119,7 +1209,7 @@ export default function App() {
               <div className="bg-primary/10 border-b border-primary/30 px-3 py-2 flex justify-between items-center text-xs font-data-mono-lg shrink-0">
                 <div className="flex items-center gap-1.5 text-primary text-[11px]">
                   <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse"></span>
-                  <span className="truncate">Historical: {selectedHistoricalAnomaly.timestamp?.replace('T', ' ').slice(0, 19)}</span>
+                  <span className="truncate">Historical: {selectedHistoricalAnomaly.timestamp ? formatISTTooltip(selectedHistoricalAnomaly.timestamp) : ''}</span>
                 </div>
                 <button
                   onClick={() => setSelectedHistoricalAnomaly(null)}

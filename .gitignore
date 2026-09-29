@@ -106,3 +106,5 @@ debug_stage5.txt
 stage5_output.txt
 stage5_calibration_out.txt
 matches.txt
+*.bak
+*.tmp

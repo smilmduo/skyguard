@@ -1,12 +1,12 @@
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+import os
+from contextlib import asynccontextmanager, suppress
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import json
 import math
-import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -15,11 +15,19 @@ from pydantic import BaseModel
 import numpy as np
 import joblib
 
+if __package__:
+    from .weather_feed import WeatherFeed
+else:
+    from weather_feed import WeatherFeed
+
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("skyguard-backend")
+
+# Indian Standard Time (IST, UTC+5:30) for Lucknow AWS Cluster
+IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -63,6 +71,7 @@ processed_telemetry = deque(maxlen=2880)
 persistent_anomaly_audit_log = deque(maxlen=500)
 fault_registry = {station: None for station in STATIONS}
 ml_models = {}
+weather_feed = WeatherFeed(STATIONS)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -94,86 +103,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to load ML artifacts: {e}", exc_info=True)
 
-    # Prime buffers with historical Open-Meteo data (3 days past) in a single batch request
-    logger.info("Priming telemetry buffers with historical Open-Meteo observations (batch query)...")
-    station_names = list(STATIONS.keys())
-    lats = ",".join(str(STATIONS[s]["lat"]) for s in station_names)
-    lons = ",".join(str(STATIONS[s]["lon"]) for s in station_names)
-    headers = {"User-Agent": "SkyGuard-AWS-Monitor/2.0 (IMD Anomaly Detection Research; smilmduo)"}
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
-            url = "https://api.open-meteo.com/v1/forecast"
-            params = {
-                "latitude": lats,
-                "longitude": lons,
-                "hourly": "temperature_2m,relative_humidity_2m,surface_pressure",
-                "past_days": 3,
-                "forecast_days": 0,
-                "timezone": "UTC"
-            }
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            results = data if isinstance(data, list) else [data]
-            for idx, station in enumerate(station_names):
-                if idx < len(results):
-                    stn_data = results[idx]
-                    hourly = stn_data.get("hourly", {})
-                    times = hourly.get("time", [])
-                    temps = hourly.get("temperature_2m", [])
-                    rhs = hourly.get("relative_humidity_2m", [])
-                    pres = hourly.get("surface_pressure", [])
-                    for t_idx, ts in enumerate(times):
-                        dt = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
-                        t_val = temps[t_idx]
-                        r_val = rhs[t_idx]
-                        p_val = pres[t_idx]
-                        if t_val is not None and r_val is not None and p_val is not None:
-                            telemetry_buffers[station].append({
-                                "timestamp": dt,
-                                "temp": float(t_val),
-                                "rh": float(r_val),
-                                "pres": float(p_val),
-                                "raw_temp": float(t_val),
-                                "raw_rh": float(r_val),
-                                "raw_pres": float(p_val)
-                            })
-                    logger.info(f"Primed {station} with {len(telemetry_buffers[station])} observations.")
-    except Exception as e:
-        logger.warning(f"Batch historical priming notice: {e}")
-
-    # Fallback Diurnal Seeder: Ensure buffers are populated even if Open-Meteo returns 429
-    if any(len(telemetry_buffers[s]) < 24 for s in STATIONS):
-        logger.warning("One or more telemetry buffers have < 24 observations (Open-Meteo rate limit). Seeding 48h synchronized diurnal baseline...")
-        for s in STATIONS:
-            telemetry_buffers[s].clear()
-        base_now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-        station_offsets = {
-            "lucknow": {"temp_base": 28.5, "rh_base": 62.0, "pres_base": 1008.0},
-            "kanpur": {"temp_base": 29.0, "rh_base": 60.0, "pres_base": 1007.5},
-            "barabanki": {"temp_base": 28.0, "rh_base": 64.0, "pres_base": 1008.5},
-            "sitapur": {"temp_base": 27.5, "rh_base": 65.0, "pres_base": 1009.0},
-        }
-        for h in range(48, -1, -1):
-            dt = base_now - timedelta(hours=h)
-            hour_of_day = dt.hour
-            solar_phase = math.sin((hour_of_day - 8.0) / 24.0 * 2 * math.pi)
-            baro_tide = math.cos(hour_of_day / 12.0 * 2 * math.pi)
-            for station, offsets in station_offsets.items():
-                t_val = round(offsets["temp_base"] + 5.5 * solar_phase, 2)
-                rh_val = round(max(20.0, min(98.0, offsets["rh_base"] - 18.0 * solar_phase)), 1)
-                p_val = round(offsets["pres_base"] - 1.5 * baro_tide, 2)
-                telemetry_buffers[station].append({
-                    "timestamp": dt,
-                    "temp": t_val,
-                    "rh": rh_val,
-                    "pres": p_val,
-                    "raw_temp": t_val,
-                    "raw_rh": rh_val,
-                    "raw_pres": p_val
-                })
-        logger.info("Successfully primed all station buffers with 48h diurnal synchronized baseline.")
+    weather_feed.load(telemetry_buffers)
+    await weather_feed.refresh(telemetry_buffers)
 
     # Initial processing of primed buffer
     apply_active_faults()
@@ -181,8 +112,12 @@ async def lifespan(app: FastAPI):
 
     # Start background polling loop
     polling_task = asyncio.create_task(poll_open_meteo_loop())
-    yield
-    polling_task.cancel()
+    try:
+        yield
+    finally:
+        polling_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await polling_task
     logger.info("SkyGuard backend shutdown complete.")
 
 app = FastAPI(
@@ -199,103 +134,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-open_meteo_backoff_until = 0
-
-def generate_next_telemetry_step(now_dt: datetime):
-    hour_of_day = now_dt.hour + now_dt.minute / 60.0
-    solar_phase = math.sin((hour_of_day - 8.0) / 24.0 * 2 * math.pi)
-    baro_tide = math.cos(hour_of_day / 12.0 * 2 * math.pi)
-    station_offsets = {
-        "lucknow": {"temp_base": 28.5, "rh_base": 62.0, "pres_base": 1008.0},
-        "kanpur": {"temp_base": 29.0, "rh_base": 60.0, "pres_base": 1007.5},
-        "barabanki": {"temp_base": 28.0, "rh_base": 64.0, "pres_base": 1008.5},
-        "sitapur": {"temp_base": 27.5, "rh_base": 65.0, "pres_base": 1009.0},
-    }
-    for s, off in station_offsets.items():
-        t_val = round(off["temp_base"] + 5.5 * solar_phase + float(np.random.normal(0, 0.04)), 2)
-        rh_val = round(max(20.0, min(98.0, off["rh_base"] - 18.0 * solar_phase + float(np.random.normal(0, 0.15)))), 1)
-        p_val = round(off["pres_base"] - 1.5 * baro_tide + float(np.random.normal(0, 0.02)), 2)
-        telemetry_buffers[s].append({
-            "timestamp": now_dt,
-            "temp": t_val, "rh": rh_val, "pres": p_val,
-            "raw_temp": t_val, "raw_rh": rh_val, "raw_pres": p_val,
-            "source": "REALTIME_SYNCHRONIZED_MESONET"
-        })
-
 async def poll_open_meteo_loop():
     while True:
         try:
             await poll_and_process()
-        except Exception as e:
-            logger.error(f"Polling loop error: {e}")
-        await asyncio.sleep(60)
+        except Exception:
+            logger.exception("Telemetry processing failed")
+        delay = max(1, weather_feed.next_wakeup() - datetime.now(IST).timestamp())
+        await asyncio.sleep(delay)
 
 async def poll_and_process():
-    global open_meteo_backoff_until
-    now_dt = datetime.now(timezone.utc).replace(microsecond=0)
-    now_ts = now_dt.timestamp()
-
-    # If within backoff window, advance physical mesonet step without outgoing HTTP request
-    if now_ts < open_meteo_backoff_until:
-        generate_next_telemetry_step(now_dt)
-        apply_active_faults()
-        rebuild_processed_telemetry()
+    if not await weather_feed.refresh(telemetry_buffers):
         return
-
-    station_names = list(STATIONS.keys())
-    lats = ",".join(str(STATIONS[s]["lat"]) for s in station_names)
-    lons = ",".join(str(STATIONS[s]["lon"]) for s in station_names)
-    headers = {"User-Agent": "SkyGuard-AWS-Monitor/2.0 (IMD Anomaly Detection Research; smilmduo)"}
-
-    try:
-        async with httpx.AsyncClient(timeout=8.0, headers=headers) as client:
-            url = "https://api.open-meteo.com/v1/forecast"
-            params = {
-                "latitude": lats,
-                "longitude": lons,
-                "current": "temperature_2m,relative_humidity_2m,surface_pressure",
-                "timezone": "UTC"
-            }
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            results = data if isinstance(data, list) else [data]
-
-            for idx, station in enumerate(station_names):
-                if idx < len(results):
-                    current = results[idx].get("current", {})
-                    raw_t = current.get("time")
-                    dt = datetime.fromisoformat(raw_t).replace(tzinfo=timezone.utc) if raw_t else now_dt
-
-                    temp = float(current.get("temperature_2m", 25.0))
-                    rh = float(current.get("relative_humidity_2m", 60.0))
-                    pres = float(current.get("surface_pressure", 1005.0))
-
-                    if telemetry_buffers[station] and telemetry_buffers[station][-1]["timestamp"] == dt:
-                        telemetry_buffers[station][-1]["raw_temp"] = temp
-                        telemetry_buffers[station][-1]["raw_rh"] = rh
-                        telemetry_buffers[station][-1]["raw_pres"] = pres
-                    else:
-                        telemetry_buffers[station].append({
-                            "timestamp": dt,
-                            "temp": temp, "rh": rh, "pres": pres,
-                            "raw_temp": temp, "raw_rh": rh, "raw_pres": pres
-                        })
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 429:
-            open_meteo_backoff_until = now_ts + 60
-            logger.info("Open-Meteo free rate limit active on datacenter IP. Advancing real-time mesonet physics buffer.")
-        else:
-            logger.warning(f"Open-Meteo API notice: {e}")
-        generate_next_telemetry_step(now_dt)
-    except Exception as e:
-        logger.warning(f"Telemetry sync notice: {e}. Generating physical step.")
-        generate_next_telemetry_step(now_dt)
-
     apply_active_faults()
     rebuild_processed_telemetry()
-
-    if fault_registry.get("lucknow") is None and processed_telemetry:
+    if (weather_feed.status(telemetry_buffers)["status"] == "current"
+            and not any(fault_registry.values()) and processed_telemetry):
         latest = processed_telemetry[-1]
         if latest.get("is_anomaly") == 1:
             existing_ts = {x.get("timestamp") for x in persistent_anomaly_audit_log}
@@ -328,7 +182,20 @@ def apply_active_faults():
 
 def rebuild_processed_telemetry():
     processed_telemetry.clear()
-    n_len = len(telemetry_buffers["lucknow"])
+    # Analyze only a contiguous, synchronized hourly series; never mix current 15-minute data.
+    common = set.intersection(*[{row["timestamp"] for row in rows} for rows in telemetry_buffers.values()])
+    ordered = sorted(common)
+    contiguous = []
+    for stamp in reversed(ordered):
+        if contiguous and (contiguous[-1] - stamp).total_seconds() != 3600:
+            break
+        contiguous.append(stamp)
+    if len(contiguous) < 24:
+        return
+    keep = set(contiguous)
+    analysis_buffers = {station: [row for row in rows if row["timestamp"] in keep]
+                        for station, rows in telemetry_buffers.items()}
+    n_len = len(analysis_buffers["lucknow"])
     if n_len == 0:
         return
 
@@ -362,7 +229,7 @@ def rebuild_processed_telemetry():
 
     neighbors = ["kanpur", "barabanki", "sitapur"]
     neighbor_maps = {
-        s: {x["timestamp"]: x for x in telemetry_buffers[s]} for s in neighbors
+        s: {x["timestamp"]: x for x in analysis_buffers[s]} for s in neighbors
     }
 
     clean_bias_t = 0.0
@@ -373,7 +240,7 @@ def rebuild_processed_telemetry():
     metadata_list = []
 
     for i in range(n_len):
-        luck_entry = telemetry_buffers["lucknow"][i]
+        luck_entry = analysis_buffers["lucknow"][i]
         ts = luck_entry["timestamp"]
         cur_t = luck_entry["temp"]
         cur_p = luck_entry["pres"]
@@ -713,6 +580,7 @@ def rebuild_processed_telemetry():
 
         processed_telemetry.append({
             "timestamp": ts_iso,
+            "source": "SIMULATED_FAULT" if any(fault_registry.values()) else "OPEN_METEO",
             "raw_temp": cur_t,
             "raw_pres": cur_p,
             "raw_rh": cur_r,
@@ -733,6 +601,10 @@ def rebuild_processed_telemetry():
         })
 
 # API Routes
+@app.get("/api/weather/status")
+async def get_weather_status():
+    return weather_feed.status(telemetry_buffers)
+
 @app.get("/api/telemetry/live")
 async def get_telemetry_live():
     if not processed_telemetry:
@@ -743,12 +615,14 @@ async def get_telemetry_live():
 async def get_telemetry_history(hours: int = 24):
     if not processed_telemetry:
         return []
-    req_len = min(len(processed_telemetry), max(1, hours))
-    return list(processed_telemetry)[-req_len:]
+    cutoff = datetime.now(IST) - timedelta(hours=max(1, min(hours, 120)))
+    return [row for row in processed_telemetry if datetime.fromisoformat(row["timestamp"]) >= cutoff]
 
 @app.get("/api/model/info")
 async def get_model_info():
     return {
+        "revision": os.getenv("RENDER_GIT_COMMIT", "local"),
+        "weather": weather_feed.status(telemetry_buffers),
         "model_name": "SkyGuard Fast Anomaly ML Specialist (16 Features)",
         "model_file": "models/isolation_forest_fast16.joblib",
         "features": ml_models.get("feature_order", []),
@@ -767,8 +641,8 @@ async def get_telemetry_multi_station(hours: int = 24):
     if not luck_buf:
         return []
     
-    n_records = min(len(luck_buf), max(1, hours))
-    target_entries = luck_buf[-n_records:]
+    cutoff = datetime.now(IST) - timedelta(hours=max(1, min(hours, 120)))
+    target_entries = [row for row in luck_buf if row["timestamp"] >= cutoff]
     
     neighbors = ["kanpur", "barabanki", "sitapur"]
     neighbor_maps = {
@@ -851,7 +725,8 @@ async def get_sensor_health():
     items = list(processed_telemetry)
     latest_item = items[-1]
     
-    recent_items = items[-24:] if len(items) >= 24 else items
+    cutoff = datetime.fromisoformat(latest_item["timestamp"]) - timedelta(hours=24)
+    recent_items = [row for row in items if datetime.fromisoformat(row["timestamp"]) >= cutoff]
     
     active_fault = fault_registry.get("lucknow")
     if active_fault is not None and persistent_anomaly_audit_log:
@@ -964,8 +839,8 @@ async def api_fault_inject(req: FaultInjectRequest):
 
     if processed_telemetry and processed_telemetry[-1].get("is_anomaly") == 1:
         anomaly_entry = dict(processed_telemetry[-1])
-        now_dt = datetime.now(timezone.utc)
-        incident_ts = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_dt = datetime.now(IST)
+        incident_ts = now_dt.isoformat()
         existing_ts = {x.get("timestamp") for x in persistent_anomaly_audit_log}
         if incident_ts in existing_ts:
             incident_ts = now_dt.isoformat()
@@ -996,27 +871,10 @@ async def api_fault_reset(clear_history: bool = False):
     }
 
 
-# Ingest endpoint (allows client browsers to forward live Open-Meteo readings)
-class TelemetryIngestItem(BaseModel):
-    station: str
-    temp: float
-    rh: float
-    pres: float
-
+# Old browser tabs must not overwrite the server-owned provider cache.
 @app.post("/api/telemetry/ingest")
-async def ingest_client_telemetry(items: list[TelemetryIngestItem]):
-    now = datetime.now(timezone.utc)
-    for it in items:
-        if it.station in STATIONS:
-            telemetry_buffers[it.station].append({
-                "timestamp": now,
-                "temp": it.temp, "rh": it.rh, "pres": it.pres,
-                "raw_temp": it.temp, "raw_rh": it.rh, "raw_pres": it.pres,
-                "source": "CLIENT_OPEN_METEO_FEED"
-            })
-    apply_active_faults()
-    rebuild_processed_telemetry()
-    return {"status": "success", "ingested": len(items)}
+async def ingest_client_telemetry():
+    raise HTTPException(status_code=410, detail="Browser weather forwarding has been retired. Refresh the dashboard.")
 
 # Legacy IMD stub (prevents 404 logs from un-refreshed client browser sessions)
 @app.api_route("/api/imd/{path:path}", methods=["GET", "POST"])
@@ -1036,7 +894,7 @@ if STATIC_DIR.exists():
     if assets_dir.exists():
         app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def serve_index():
     index_file = STATIC_DIR / "index.html"
     if index_file.exists():
